@@ -1,0 +1,11 @@
+.env
+*.db
+logs/
+.pytest_cache/
+__pycache__/
+*.pyc
+data/*.db
+temp_auction_citywise/
+scratch/
+_app.py_backup*
+test_page.txt
