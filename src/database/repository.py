@@ -2,12 +2,15 @@ import sqlite3
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from pathlib import Path
+import pandas as pd
 from src.utils.logger import logger
 from src.config import config
 from src.models import Property
 
 class DatabaseRepository:
     """Repository for all SQLite interactions."""
+
+    _schema_initialized = False
     
     def __init__(self, db_path: str = config.DB_NAME):
         self.db_path = db_path
@@ -15,12 +18,41 @@ class DatabaseRepository:
 
     def _get_connection(self) -> sqlite3.Connection:
         """Helper to get a database connection."""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=30000")
         return conn
+
+    def ping(self) -> Dict[str, Any]:
+        """Quick database connectivity check."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) as count FROM properties")
+                count = cursor.fetchone()["count"]
+            return {"ok": True, "property_count": count, "db_path": self.db_path}
+        except Exception as exc:
+            logger.error(f"Database ping failed: {exc}")
+            return {"ok": False, "property_count": 0, "db_path": self.db_path, "error": str(exc)}
+
+    def fetch_properties_dataframe(self, limit: Optional[int] = None) -> pd.DataFrame:
+        """Bulk-load properties as a DataFrame (faster than row-by-row Pydantic)."""
+        sql = "SELECT * FROM properties ORDER BY crawled_at DESC"
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        try:
+            with self._get_connection() as conn:
+                return pd.read_sql_query(sql, conn)
+        except Exception as exc:
+            logger.error(f"Error loading properties dataframe: {exc}")
+            return pd.DataFrame()
 
     def _init_db(self):
         """Initializes the database schema if it doesn't exist."""
+        if DatabaseRepository._schema_initialized:
+            return
         logger.info(f"Checking database initialization at {self.db_path}")
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -154,8 +186,18 @@ class DatabaseRepository:
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_properties_market_rate ON properties(market_rate_sqft)"
             )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_properties_city ON properties(city)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_properties_bank ON properties(bank_name)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_properties_crawled_at ON properties(crawled_at DESC)"
+            )
             
             conn.commit()
+            DatabaseRepository._schema_initialized = True
 
     @staticmethod
     def _parse_db_datetime(value) -> Optional[datetime]:

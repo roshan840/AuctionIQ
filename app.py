@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import os
+import sqlite3
 from src.utils.logger import logger
 from src.config import config, CITY_TO_STATE
 from src.database.repository import DatabaseRepository
@@ -383,9 +385,10 @@ st.markdown(MAIN_CSS, unsafe_allow_html=True)
 
 
 # ─── Services ────────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
 def get_services():
-    repo     = DatabaseRepository()
-    scraper  = ScraperService(repo)
+    repo = DatabaseRepository()
+    scraper = ScraperService(repo)
     enricher = AIService()
     return repo, scraper, enricher
 
@@ -524,28 +527,35 @@ def auction_status_label(row, now):
 
 
 # ─── Data Loading ────────────────────────────────────────────────────────────
-@st.cache_data(ttl=300, show_spinner=False)
-def load_data():
-    props = repo.get_all_properties()
-    if not props:
+@st.cache_data(ttl=300, show_spinner="Loading auction data…")
+def load_data(db_path: str, db_mtime: float):
+    try:
+        with sqlite3.connect(db_path, timeout=30) as conn:
+            df = pd.read_sql_query(
+                "SELECT * FROM properties ORDER BY crawled_at DESC", conn
+            )
+    except Exception as exc:
+        logger.error(f"Error loading properties from database: {exc}")
         return pd.DataFrame()
-    df = pd.DataFrame([p.model_dump() for p in props])
-    now        = datetime.now()
+
+    if df.empty:
+        return df
+
+    now = datetime.now()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
     df['parsed_start_date'] = df['auction_start_date'].apply(parse_auction_date)
-    df['parsed_end_time']   = df['auction_end_time'].apply(parse_auction_date)
+    df['parsed_end_time'] = df['auction_end_time'].apply(parse_auction_date)
     df['crawled_at'] = pd.to_datetime(df['crawled_at'], errors='coerce')
 
     df['is_active'] = (
         (df['parsed_start_date'] >= today_start) |
-        (df['parsed_end_time']   >= now)
+        (df['parsed_end_time'] >= now)
     ).fillna(False)
 
     mask_na = df['parsed_start_date'].isna() & df['parsed_end_time'].isna()
     df.loc[mask_na, 'is_active'] = df.loc[mask_na, 'crawled_at'] >= (now - timedelta(days=7))
 
-    # Keep scraped province/state; add mapped region for analytics
     df['state_region'] = df['city'].map(CITY_TO_STATE).fillna('Other')
     return df
 
@@ -575,6 +585,64 @@ def run_enrichment_batches(pending, batch_size: int = 5, on_batch=None) -> int:
             if repo.update_enrichment(prop.id, update_payload):
                 success_count += 1
     return success_count
+
+
+DATA_EXPLORER_COLUMNS = [
+    "is_active", "investment_score", "risk_rating", "title", "property_type", "asset_category",
+    "reserve_price", "discount_rate_percent", "emd", "area_sqft", "rate_sqft", "market_rate_sqft",
+    "village", "area_locality", "city", "state", "state_region", "bank_name", "branch_name",
+    "borrower_name", "auction_type", "auction_start_date", "auction_end_time",
+    "application_submission_date", "possession_status", "contact_details", "description",
+    "source_url", "notice_image_url",
+]
+
+
+def prepare_explorer_df(source_df: pd.DataFrame) -> pd.DataFrame:
+    """Build a safe dataframe for Streamlit table rendering."""
+    if source_df.empty:
+        return source_df.copy()
+
+    cols = [c for c in DATA_EXPLORER_COLUMNS if c in source_df.columns]
+    out = source_df[cols].copy()
+
+    for link_col in ("source_url", "notice_image_url"):
+        if link_col in out.columns:
+            out[link_col] = out[link_col].where(
+                out[link_col].notna() & (out[link_col].astype(str).str.strip() != "N/A"),
+                None,
+            )
+
+    if "investment_score" in out.columns:
+        out["investment_score"] = pd.to_numeric(out["investment_score"], errors="coerce")
+
+    return out
+
+
+def safe_column_subset(source_df: pd.DataFrame, columns: list) -> pd.DataFrame:
+    """Return only columns that exist in the dataframe."""
+    existing = [c for c in columns if c in source_df.columns]
+    return source_df[existing].copy() if existing else source_df.copy()
+
+
+EXPLORER_COLUMN_CONFIG = {
+    "is_active": st.column_config.CheckboxColumn("Active"),
+    "investment_score": st.column_config.NumberColumn("Score", format="%d"),
+    "risk_rating": st.column_config.TextColumn("Risk"),
+    "title": st.column_config.TextColumn("Property Title", width="large"),
+    "property_type": st.column_config.TextColumn("Type"),
+    "reserve_price": st.column_config.NumberColumn("Reserve ₹", format="₹%d"),
+    "emd": st.column_config.NumberColumn("EMD ₹", format="₹%d"),
+    "discount_rate_percent": st.column_config.NumberColumn("Discount %", format="%.1f%%"),
+    "area_sqft": st.column_config.NumberColumn("Area (sqft)", format="%.0f"),
+    "rate_sqft": st.column_config.NumberColumn("Rate/sqft", format="₹%.0f"),
+    "market_rate_sqft": st.column_config.NumberColumn("Market Rate", format="₹%.0f"),
+    "auction_start_date": st.column_config.TextColumn("Start Date"),
+    "auction_end_time": st.column_config.TextColumn("End Date"),
+    "contact_details": st.column_config.TextColumn("Contact Info", width="medium"),
+    "description": st.column_config.TextColumn("Description", width="large"),
+    "source_url": st.column_config.LinkColumn("Property Link", display_text="View Source"),
+    "notice_image_url": st.column_config.LinkColumn("Sale Notice", display_text="Download"),
+}
 
 
 # ─── HTML Components ─────────────────────────────────────────────────────────
@@ -685,7 +753,8 @@ def property_card(row, now):
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
 # Load data
-df = load_data()
+_db_mtime = os.path.getmtime(config.DB_NAME) if os.path.exists(config.DB_NAME) else 0.0
+df = load_data(config.DB_NAME, _db_mtime)
 
 # 🌍 Apply Permissions Filtering
 if not is_admin:
@@ -718,10 +787,10 @@ st.sidebar.markdown("""
 """, unsafe_allow_html=True)
 
 
-# City Active Intelligence (NEW)
+# City Active Intelligence (top cities only — keeps sidebar fast)
 if not df.empty:
     st.sidebar.markdown("**📍 Active by City**")
-    city_active = df[df['is_active']].groupby('city').size().sort_values(ascending=False)
+    city_active = df[df['is_active']].groupby('city').size().sort_values(ascending=False).head(10)
     for city, count in city_active.items():
         st.sidebar.markdown(f"""
             <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 8px;background:rgba(16,185,129,0.05);border-radius:6px;margin-bottom:4px;border:1px solid rgba(16,185,129,0.1);">
@@ -729,7 +798,26 @@ if not df.empty:
                 <span style="font-size:0.85em;font-weight:800;color:#10b981;">{count}</span>
             </div>
         """, unsafe_allow_html=True)
+    if df[df['is_active']].groupby('city').size().shape[0] > 10:
+        st.sidebar.caption("Showing top 10 cities by active auctions.")
     st.sidebar.markdown('<div style="height:12px;"></div>', unsafe_allow_html=True)
+
+# Connection status
+with st.sidebar.expander("🔌 System Status", expanded=False):
+    db_status = repo.ping()
+    if db_status.get("ok"):
+        st.success(f"Database OK — {db_status['property_count']:,} properties")
+    else:
+        st.error(f"Database error: {db_status.get('error', 'unknown')}")
+
+    api_keys = config.GEMINI_API_KEYS
+    if api_keys:
+        st.caption(f"Gemini API keys configured: {len(api_keys)}")
+    else:
+        st.warning("No Gemini API keys in .env")
+
+    active_n = int(df['is_active'].sum()) if not df.empty else 0
+    st.caption(f"Loaded {len(df):,} rows · {active_n:,} active · cache TTL 5 min")
 
 
 
@@ -1161,7 +1249,7 @@ dff = df.copy()
 if only_active:
     dff = dff[dff['is_active'] == True]
 if score_range > 0:
-    dff = dff[dff['investment_score'] >= score_range]
+    dff = dff[dff['investment_score'].fillna(0) >= score_range]
 if search_q:
     mask = (dff['title'].str.contains(search_q, case=False, na=False) |
             dff['area_locality'].str.contains(search_q, case=False, na=False) |
@@ -1259,13 +1347,33 @@ with tab1:
         st.markdown("""<div style="text-align:center;padding:60px;color:#475569;">
             No properties match your filters.</div>""", unsafe_allow_html=True)
     else:
+        CARD_PAGE_SIZE = 24
+        if "card_offset" not in st.session_state:
+            st.session_state.card_offset = CARD_PAGE_SIZE
+        if st.session_state.get("card_filter_key") != len(dff):
+            st.session_state.card_offset = CARD_PAGE_SIZE
+            st.session_state.card_filter_key = len(dff)
+
+        visible = dff.iloc[:st.session_state.card_offset]
         cols_per_row = 3
-        rows = [dff.iloc[i:i+cols_per_row] for i in range(0, len(dff), cols_per_row)]
+        rows = [visible.iloc[i:i + cols_per_row] for i in range(0, len(visible), cols_per_row)]
         for row_df in rows:
             cols = st.columns(cols_per_row)
             for col, (_, prop) in zip(cols, row_df.iterrows()):
                 with col:
                     st.markdown(property_card(prop, now), unsafe_allow_html=True)
+
+        shown = len(visible)
+        st.caption(f"Showing {shown:,} of {len(dff):,} matching properties")
+        if shown < len(dff):
+            remaining = len(dff) - shown
+            if st.button(
+                f"Load {min(CARD_PAGE_SIZE, remaining)} more properties",
+                key="load_more_cards",
+                use_container_width=True,
+            ):
+                st.session_state.card_offset += CARD_PAGE_SIZE
+                st.rerun()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1277,43 +1385,41 @@ with tab2:
         Full dataset view with all fields. Click column headers to sort.
       </span></div>""", unsafe_allow_html=True)
 
-    display_df = dff[[
-        'is_active','investment_score','risk_rating','title','property_type','asset_category',
-        'reserve_price','discount_rate_percent','emd', 'area_sqft', 'rate_sqft', 'market_rate_sqft',
-        'village','area_locality', 'city', 'state', 'bank_name', 'branch_name', 'borrower_name', 
-        'auction_type', 'auction_start_date', 'auction_end_time', 'application_submission_date', 
-        'possession_status', 'contact_details', 'description', 'source_url', 'notice_image_url' 
-    ]].copy() if all(c in dff.columns for c in ['is_active','investment_score']) else dff
+    if dff.empty:
+        st.info("No properties match your current filters. Try turning off **Active Auctions Only** in the sidebar.")
+    else:
+        EXPLORER_PAGE_SIZE = 200
+        display_df = prepare_explorer_df(dff)
+        total_pages = max(1, math.ceil(len(display_df) / EXPLORER_PAGE_SIZE))
+        ep1, ep2 = st.columns([1, 3])
+        with ep1:
+            page = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
+        with ep2:
+            st.caption(
+                f"Showing rows {(page - 1) * EXPLORER_PAGE_SIZE + 1:,}"
+                f"–{min(page * EXPLORER_PAGE_SIZE, len(display_df)):,}"
+                f" of {len(display_df):,} properties"
+            )
 
-    st.dataframe(
-        display_df,
-        column_config={
-            "is_active":             st.column_config.CheckboxColumn("🟢 Active"),
-            "investment_score":      st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d"),
-            "risk_rating":           st.column_config.TextColumn("Risk"),
-            "title":                 st.column_config.TextColumn("Property Title", width="large"),
-            "property_type":         st.column_config.TextColumn("Type"),
-            "reserve_price":         st.column_config.NumberColumn("Reserve ₹", format="₹%d"),
-            "emd":                   st.column_config.NumberColumn("EMD ₹", format="₹%d"),
-            "discount_rate_percent": st.column_config.NumberColumn("Discount %", format="%.1f%%"),
-            "area_sqft":             st.column_config.NumberColumn("Area (sqft)", format="%.0f"),
-            "rate_sqft":             st.column_config.NumberColumn("Rate/sqft", format="₹%.0f"),
-            "auction_start_date":    st.column_config.TextColumn("Start Date"),
-            "contact_details":       st.column_config.TextColumn("Contact Info", width="medium"),
-            "source_url":            st.column_config.LinkColumn("Property Link", display_text="View Source"),
-            "notice_image_url":      st.column_config.LinkColumn("Sale Notice", display_text="Download PDF/Img"),
-        },
-        width="stretch",
-        height=750,
-        hide_index=True
-    )
+        start = (page - 1) * EXPLORER_PAGE_SIZE
+        page_df = display_df.iloc[start:start + EXPLORER_PAGE_SIZE]
+        table_cols = [c for c in page_df.columns if c in EXPLORER_COLUMN_CONFIG]
+        column_config = {c: EXPLORER_COLUMN_CONFIG[c] for c in table_cols}
 
-    csv = dff.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        "📥 Export Filtered Data (CSV)", csv,
-        "auction_export.csv", "text/csv",
-        width="stretch"
-    )
+        st.dataframe(
+            page_df,
+            column_config=column_config,
+            use_container_width=True,
+            height=600,
+            hide_index=True,
+        )
+
+        csv = display_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            "📥 Export All Filtered Data (CSV)", csv,
+            "auction_export.csv", "text/csv",
+            use_container_width=True,
+        )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1322,13 +1428,16 @@ with tab2:
 with tab3:
     st.markdown("""<div style="background:var(--bg-card);border-radius:12px;padding:18px 24px;margin-bottom:20px;border-left:4px solid #FF385C;"><div style="font-size:1.1em;font-weight:900;color:var(--text-main);">📊 Advanced Market Intelligence</div><div style="font-size:.78em;color:var(--text-muted);margin-top:3px;">Multi-dimensional analytics for smarter investment decisions</div></div>""", unsafe_allow_html=True)
 
+    chart_df = dff
+    if len(chart_df) > 3000:
+        chart_df = chart_df.sample(3000, random_state=42)
 
     # 🤖 AI Summary Brief
     with st.container():
         st.markdown("### 🤖 Market Intelligence Brief")
         if st.toggle("Generate Real-time AI Briefing", value=False, key="gen_summary"):
             with st.spinner("AI analyzing localized trends..."):
-                market_brief = enricher.generate_market_summary(df.to_dict('records'))
+                market_brief = enricher.generate_market_summary(dff.head(100).to_dict('records'))
                 st.markdown(f"""<div style="background:rgba(255,56,92,0.02);padding:24px;border-radius:16px;border:1px solid var(--border-alpha);margin-bottom:30px;font-size:0.95em;color:var(--text-main);box-shadow:var(--card-shadow);">{market_brief}</div>""", unsafe_allow_html=True)
 
 
@@ -1340,7 +1449,7 @@ with tab3:
     st.markdown("### 💰 Price Intelligence")
     pi_c1, pi_c2 = st.columns(2)
 
-    scatter_df = df.dropna(subset=['reserve_price','market_rate_sqft','rate_sqft']).copy()
+    scatter_df = chart_df.dropna(subset=['reserve_price','market_rate_sqft','rate_sqft']).copy()
     if not scatter_df.empty:
         area_med = scatter_df['area_sqft'].median()
         scatter_df['area_sqft'] = scatter_df['area_sqft'].fillna(
@@ -1365,7 +1474,7 @@ with tab3:
     else:
         pi_c1.info("Run AI Enrichment to unlock this chart.")
 
-    box_df = df.dropna(subset=['reserve_price','property_type']).copy()
+    box_df = chart_df.dropna(subset=['reserve_price','property_type']).copy()
     box_df = box_df[box_df['property_type'].str.strip() != '']
     if not box_df.empty:
         fig_bx = px.box(box_df, x='property_type', y='reserve_price',
@@ -1376,7 +1485,7 @@ with tab3:
         fig_bx.update_layout(showlegend=False,xaxis_tickangle=-30)
         render_plotly(pi_c2, fig_bx)
     else:
-        hdf = df.dropna(subset=['reserve_price'])
+        hdf = chart_df.dropna(subset=['reserve_price'])
         if not hdf.empty:
             fig_h = px.histogram(hdf, x='reserve_price', nbins=25,
                                   title='Reserve Price Distribution',
@@ -1391,7 +1500,7 @@ with tab3:
     st.markdown("### 🎯 Opportunity Radar")
     or_c1, or_c2 = st.columns(2)
 
-    radar_df = df.dropna(subset=['investment_score','discount_rate_percent'])
+    radar_df = chart_df.dropna(subset=['investment_score','discount_rate_percent'])
     if not radar_df.empty:
         fig_mx = px.scatter(radar_df, x='discount_rate_percent', y='investment_score',
                             color='risk_rating', size='reserve_price',
@@ -1412,7 +1521,7 @@ with tab3:
     else:
         or_c1.info("Run AI Enrichment to unlock the Risk vs Reward Matrix.")
 
-    top_disc = df.dropna(subset=['discount_rate_percent']).sort_values('discount_rate_percent', ascending=False).head(10)
+    top_disc = chart_df.dropna(subset=['discount_rate_percent']).sort_values('discount_rate_percent', ascending=False).head(10)
     if not top_disc.empty:
         fig_td = px.bar(top_disc, x='discount_rate_percent',
                         y=top_disc['title'].str[:30].str.cat(top_disc['city'].fillna(''), sep=' · '),
@@ -1547,7 +1656,7 @@ with tab3:
     
     # Export options
     e1, e2 = st.columns([1, 4])
-    csv = dff[allowed_cols].to_csv(index=False).encode('utf-8')
+    csv = safe_column_subset(dff, allowed_cols).to_csv(index=False).encode('utf-8')
     e1.download_button("📥 Export CSV", csv, "auctions.csv", "text/csv", use_container_width=True)
     
     if st.button("📄 Generate Intelligence PDF"):
@@ -1555,8 +1664,11 @@ with tab3:
             pdf_data = export_pdf(dff, allowed_cols)
             st.download_button("⬇️ Download PDF Report", pdf_data, "AuctionIQ_Report.pdf", "application/pdf")
 
-    # Dataframe with filtered columns
-    st.dataframe(dff[allowed_cols], hide_index=True, height=500, use_container_width=True)
+    intel_df = prepare_explorer_df(safe_column_subset(dff, allowed_cols))
+    if intel_df.empty:
+        st.info("No data available for the selected filters.")
+    else:
+        st.dataframe(intel_df, hide_index=True, height=500, use_container_width=True)
 
     st.markdown("---")
 
